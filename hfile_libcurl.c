@@ -24,7 +24,6 @@ DEALINGS IN THE SOFTWARE.  */
 
 #include <config.h>
 
-#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +32,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include <errno.h>
 #include <sys/select.h>
 
+#include "hts_internal.h"
 #include "hfile_internal.h"
 #include "htslib/hts.h"  // for hts_version() and hts_verbose
 #include "htslib/kstring.h"
@@ -454,6 +454,8 @@ static int add_header(hFILE_libcurl *fp, const char *header)
 
 static int
 add_s3_settings(hFILE_libcurl *fp, const char *url, kstring_t *message);
+static int
+add_gcs_settings(hFILE_libcurl *fp, const char *gcs_url);
 
 hFILE *hopen_libcurl(const char *url, const char *modes)
 {
@@ -499,7 +501,7 @@ hFILE *hopen_libcurl(const char *url, const char *modes)
         if (add_header(fp, "Transfer-Encoding: chunked") < 0) goto error;
     }
 
-    if (tolower(url[0]) == 's' && url[1] == '3') {
+    if (tolower_c(url[0]) == 's' && url[1] == '3') {
         // Construct the HTTP-Method/Content-MD5/Content-Type part of the
         // message to be signed.  This will be destroyed by add_s3_settings().
         kstring_t message = { 0, 0, NULL };
@@ -507,8 +509,9 @@ hFILE *hopen_libcurl(const char *url, const char *modes)
         kputc('\n', &message);
         kputc('\n', &message);
         if (add_s3_settings(fp, url, &message) < 0) goto error;
-    }
-    else
+    } else if (tolower(url[0]) == 'g' && tolower(url[1]) == 's') {
+      if (add_gcs_settings(fp, url) < 0) goto error;
+    } else
         err |= curl_easy_setopt(fp->easy, CURLOPT_URL, url);
 
     err |= curl_easy_setopt(fp->easy, CURLOPT_USERAGENT, curl.useragent.s);
@@ -587,6 +590,7 @@ int PLUGIN_GLOBAL(hfile_plugin_init,_libcurl)(struct hFILE_plugin *self)
 
     hfile_add_scheme_handler("s3", &handler);
     hfile_add_scheme_handler("s3+http", &handler);
+    hfile_add_scheme_handler("gs", &handler);
     if (info->features & CURL_VERSION_SSL)
         hfile_add_scheme_handler("s3+https", &handler);
 
@@ -597,6 +601,41 @@ int PLUGIN_GLOBAL(hfile_plugin_init,_libcurl)(struct hFILE_plugin *self)
 /*******************
  * Rewrite S3 URLs *
  *******************/
+
+static size_t kput_callback(char *ptr, size_t size, size_t nmemb, void *strv)
+{
+    kstring_t *str = (kstring_t *) strv;
+    size_t len = size * nmemb;
+    return (kputsn(ptr, len, str) >= 0)? len : 0;
+}
+
+static int curl_kput(const char *url, kstring_t *str)
+{
+    CURLcode err;
+    CURL *easy = curl_easy_init();
+    if (easy == NULL) { errno = ENOMEM; return -1; }
+
+    err  = curl_easy_setopt(easy, CURLOPT_URL, url);
+    err |= curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, kput_callback);
+    err |= curl_easy_setopt(easy, CURLOPT_WRITEDATA, str);
+    err |= curl_easy_setopt(easy, CURLOPT_USERAGENT, curl.useragent.s);
+    err |= curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    err |= curl_easy_setopt(easy, CURLOPT_FAILONERROR, 1L);
+    if (hts_verbose >= 8) err |= curl_easy_setopt(easy, CURLOPT_VERBOSE, 1L);
+    if (err != 0) { curl_easy_cleanup(easy); errno = ENOSYS; return -1; }
+
+    err = curl_easy_perform(easy);
+    if (err != CURLE_OK) {
+        int save_errno = easy_errno(easy, err);
+        curl_easy_cleanup(easy);
+        errno = save_errno;
+        return -1;
+    }
+
+    curl_easy_cleanup(easy);
+    return 0;
+}
+
 
 #if defined HAVE_COMMONCRYPTO
 
@@ -643,6 +682,13 @@ urldecode_kput(const char *s, int len, hFILE_libcurl *fp, kstring_t *str)
     else kputsn(s, len, str);
 }
 
+static void urlencode_kput(const char* to_escape, hFILE_libcurl* fp, kstring_t* output) {
+  char* result = curl_easy_escape(fp->easy, to_escape, 0 /*len*/);
+  if (result == NULL) abort();
+  kputs(result, output);
+  curl_free(result);
+}
+
 static void base64_kput(const unsigned char *data, size_t len, kstring_t *str)
 {
     static const char base64[] =
@@ -673,17 +719,17 @@ static int is_dns_compliant(const char *s0, const char *slim)
     const char *s;
 
     for (s = s0; s < slim; len++, s++)
-        if (islower(*s))
+        if (islower_c(*s))
             has_nondigit = 1;
         else if (*s == '-') {
             has_nondigit = 1;
             if (s == s0 || s+1 == slim) return 0;
         }
-        else if (isdigit(*s))
+        else if (isdigit_c(*s))
             ;
         else if (*s == '.') {
-            if (s == s0 || ! isalnum(s[-1])) return 0;
-            if (s+1 == slim || ! isalnum(s[1])) return 0;
+            if (s == s0 || ! isalnum_c(s[-1])) return 0;
+            if (s+1 == slim || ! isalnum_c(s[1])) return 0;
         }
         else return 0;
 
@@ -729,12 +775,12 @@ static void parse_ini(const char *fname, const char *section, ...)
             const char *key = line.s, *value = &s[1], *akey;
             va_list args;
 
-            while (isspace(*key)) key++;
-            while (s > key && isspace(s[-1])) s--;
+            while (isspace_c(*key)) key++;
+            while (s > key && isspace_c(s[-1])) s--;
             *s = '\0';
 
-            while (isspace(*value)) value++;
-            while (line.l > 0 && isspace(line.s[line.l-1]))
+            while (isspace_c(*value)) value++;
+            while (line.l > 0 && isspace_c(line.s[line.l-1]))
                 line.s[--line.l] = '\0';
 
             va_start(args, section);
@@ -763,14 +809,64 @@ static void parse_simple(const char *fname, kstring_t *id, kstring_t *secret)
     fclose(fp);
 
     s = text.s;
-    while (isspace(*s)) s++;
+    while (isspace_c(*s)) s++;
     kputsn(s, len = strcspn(s, " \t"), id);
 
     s += len;
-    while (isspace(*s)) s++;
+    while (isspace_c(*s)) s++;
     kputsn(s, strcspn(s, " \t"), secret);
 
     free(text.s);
+}
+
+// Reformat the url for the GCS API, and add an OAuth header.
+// GCS URL format is gs://BUCKET/PATH. We convert this to
+// https://www.googleapis.com/storage/v1/b/BUCKET/o/PATH?alt=media,
+// where PATH is url-escaped.
+// We get the token for the OAuth header from the environment variable
+// GCS_OAUTH_TOKEN, which you can set using the gcloud tool, e.g.
+//  > gcloud auth application-default login
+//  > export GCS_OAUTH_TOKEN=`gcloud auth application-default print-access-token`
+// For production environments, set up a service account and use its credentials, e.g.
+//  > export GOOGLE_APPLICATION_CREDENTIALS="/path/to/key.json"
+//  > export GCS_OAUTH_TOKEN=`gcloud auth application-default print-access-token`
+static int add_gcs_settings(hFILE_libcurl* fp, const char* gcs_url) {
+  int ret, save;
+  kstring_t url = { 0, 0, NULL };
+  kstring_t auth_hdr = { 0, 0, NULL };
+
+  const char* bucket = &gcs_url[3];
+  while (*bucket == '/') bucket++;
+  const char* path = bucket + strcspn(bucket, "/");
+
+  kputs("https://www.googleapis.com/storage/v1/b/", &url);
+  kputsn(bucket, path - bucket, &url);
+  kputs("/o/", &url);
+  // Exclude the leading '/' in path.
+  urlencode_kput(path+1, fp, &url);
+  kputs("?alt=media", &url);
+  CURLcode err = curl_easy_setopt(fp->easy, CURLOPT_URL, url.s);
+  if (err != CURLE_OK) { errno = easy_errno(fp->easy, err); goto error; }
+
+  const char* oauth_token = getenv("GCS_OAUTH_TOKEN");
+  if (oauth_token != NULL) {
+    kputs("Authorization: Bearer ", &auth_hdr);
+    kputs(oauth_token, &auth_hdr);
+    if (add_header(fp, auth_hdr.s) < 0) goto error;
+  }
+
+  ret = 0;
+  goto free_and_return;
+
+error:
+  ret = -1;
+
+free_and_return:
+  save = errno;
+  free(url.s);
+  free(auth_hdr.s);
+  errno = save;
+  return ret;
 }
 
 static int
