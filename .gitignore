@@ -8,15 +8,20 @@
 autom4te.cache
 config.cache
 config.h
+config.h.in
 config.log
 config.mk
 config.status
 configure
 
 hfile_*.bundle
+hfile_*.cygdll
+hfile_*.dll
 hfile_*.so
 
+cyg*.dll
 lib*.a
+lib*.dll
 lib*.dylib
 lib*.so
 lib*.so.*
